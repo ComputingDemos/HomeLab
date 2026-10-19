@@ -1,0 +1,139 @@
+name: homelab
+
+services:
+  gw:
+    build:
+      context: .
+      dockerfile: Dockerfile.lab
+    command: ["sleep", "infinity"]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      lab-left:
+        ipv4_address: 10.10.1.1
+      lab-right:
+        ipv4_address: 10.10.2.1
+    restart: unless-stopped
+
+  src:
+    build:
+      context: .
+      dockerfile: Dockerfile.lab
+    cap_add: [NET_ADMIN]
+    command: ["sh", "-c", "ip route add 10.10.2.0/24 via 10.10.1.1 && exec sleep infinity"]
+    networks:
+      lab-left:
+        ipv4_address: 10.10.1.10
+    volumes:
+      - ./pcaps:/pcaps:ro
+    restart: unless-stopped
+
+  dst:
+    build:
+      context: .
+      dockerfile: Dockerfile.lab
+    cap_add: [NET_ADMIN]
+    command: ["sh", "-c", "ip route add 10.10.1.0/24 via 10.10.2.1 && exec sleep infinity"]
+    networks:
+      lab-right:
+        ipv4_address: 10.10.2.10
+    restart: unless-stopped
+
+  zeek:
+    image: zeek/zeek:lts
+    command: ["sleep", "infinity"]
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.10
+    volumes:
+      - ./pcaps:/pcaps:ro
+      - ./zeek-logs:/logs
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.4
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.40
+    volumes:
+      - arkime-db:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      start_period: 120s
+      retries: 20
+    restart: unless-stopped
+
+  arkime-capture:
+    image: ghcr.io/arkime/arkime/arkime:v6-latest
+    command: ["sleep", "infinity"]
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.20
+    volumes:
+      - ./arkime/config.ini:/opt/arkime/etc/config.ini:ro
+      - ./pcaps:/pcaps:ro
+      - arkime-raw:/opt/arkime/raw
+    restart: unless-stopped
+
+  arkime-viewer:
+    image: ghcr.io/arkime/arkime/arkime:v6-latest
+    command:
+      - /opt/arkime/bin/docker.sh
+      - viewer
+      - --wait-for-db
+      - http://opensearch:9200
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.21
+    # The internal Docker bridge may block the localhost port mapping.
+    # From Firefox inside Ubuntu, use http://10.10.3.21:8005.
+    ports:
+      - "127.0.0.1:8005:8005"
+    volumes:
+      - ./arkime/config.ini:/opt/arkime/etc/config.ini:ro
+      - arkime-raw:/opt/arkime/raw
+    restart: unless-stopped
+
+networks:
+  lab-left:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+          gateway: 10.10.1.254
+  lab-right:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+          gateway: 10.10.2.254
+  lab-tools:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.3.0/24
+          gateway: 10.10.3.254
+
+volumes:
+  arkime-db:
+  arkime-raw:
