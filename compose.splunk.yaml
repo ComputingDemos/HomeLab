@@ -1,0 +1,59 @@
+services:
+  splunk:
+    image: splunk/splunk:10.4.4
+    hostname: splunk
+    environment:
+      SPLUNK_START_ARGS: "--accept-license"
+      SPLUNK_GENERAL_TERMS: "--accept-sgt-current-at-splunk-com"
+      SPLUNK_PASSWORD: ${SPLUNK_PASSWORD:?Create a .env file with SPLUNK_PASSWORD}
+    networks:
+      lab-left:
+        ipv4_address: 10.10.1.30
+      lab-right:
+        ipv4_address: 10.10.2.30
+      lab-tools:
+        ipv4_address: 10.10.3.30
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - splunk-etc:/opt/splunk/etc
+      - splunk-var:/opt/splunk/var
+      - ./splunk-app:/opt/splunk/etc/apps/lab_inputs:ro
+      - ./zeek-logs:/zeek-logs:ro
+    restart: unless-stopped
+
+  src:
+    build:
+      context: .
+      dockerfile: Dockerfile.uf
+    entrypoint: ["/usr/local/bin/uf-entrypoint.sh"]
+    command: []
+    hostname: src
+    environment:
+      LAB_NODE: src
+      PEER_SUBNET: 10.10.2.0/24
+      PEER_GATEWAY: 10.10.1.1
+      SPLUNK_RECEIVER: 10.10.1.30:9997
+      UF_ADMIN_PASSWORD: ${UF_ADMIN_PASSWORD:?Create a .env file with UF_ADMIN_PASSWORD}
+    depends_on:
+      - splunk
+
+  dst:
+    build:
+      context: .
+      dockerfile: Dockerfile.uf
+    entrypoint: ["/usr/local/bin/uf-entrypoint.sh"]
+    command: []
+    hostname: dst
+    environment:
+      LAB_NODE: dst
+      PEER_SUBNET: 10.10.1.0/24
+      PEER_GATEWAY: 10.10.2.1
+      SPLUNK_RECEIVER: 10.10.2.30:9997
+      UF_ADMIN_PASSWORD: ${UF_ADMIN_PASSWORD:?Create a .env file with UF_ADMIN_PASSWORD}
+    depends_on:
+      - splunk
+
+volumes:
+  splunk-etc:
+  splunk-var:
