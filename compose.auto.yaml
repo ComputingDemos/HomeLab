@@ -1,0 +1,192 @@
+name: homelab
+
+services:
+  gw:
+    build:
+      context: .
+      dockerfile: Dockerfile.lab
+    command: ["sleep", "infinity"]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      lab-left:
+        ipv4_address: 10.10.1.1
+      lab-right:
+        ipv4_address: 10.10.2.1
+    restart: unless-stopped
+
+  src:
+    build:
+      context: .
+      dockerfile: Dockerfile.lab
+    cap_add: [NET_ADMIN]
+    command: ["sh", "-c", "ip route add 10.10.2.0/24 via 10.10.1.1 && exec sleep infinity"]
+    networks:
+      lab-left:
+        ipv4_address: 10.10.1.10
+    volumes:
+      - ./pcaps:/pcaps:ro
+    restart: unless-stopped
+
+  dst:
+    build:
+      context: .
+      dockerfile: Dockerfile.lab
+    cap_add: [NET_ADMIN]
+    command: ["sh", "-c", "ip route add 10.10.1.0/24 via 10.10.2.1 && exec sleep infinity"]
+    networks:
+      lab-right:
+        ipv4_address: 10.10.2.10
+    restart: unless-stopped
+
+  zeek:
+    image: zeek/zeek:lts
+    command: ["sleep", "infinity"]
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.10
+    volumes:
+      - ./pcaps:/pcaps:ro
+      - ./zeek-logs:/logs
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.4
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.40
+    volumes:
+      - arkime-db:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      start_period: 120s
+      retries: 20
+    restart: unless-stopped
+
+  arkime-init:
+    image: ghcr.io/arkime/arkime/arkime:v6-latest
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    networks:
+      lab-tools: {}
+    volumes:
+      - arkime-etc:/opt/arkime/etc
+      - ./arkime:/legacy-arkime:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        config=/opt/arkime/etc/config.ini
+        if [ ! -s "$$config" ] && [ -s /legacy-arkime/config.ini ] && [ -f /legacy-arkime/config.ini ]; then
+          cp /legacy-arkime/config.ini "$$config"
+          chmod 644 "$$config"
+        fi
+        if [ ! -s "$$config" ]; then
+          if curl -fsS http://opensearch:9200/arkime_users/_doc/admin >/dev/null; then
+            echo 'Existing Arkime admin detected. Preserve the original config.ini/passwordSecret before migrating.' >&2
+            exit 1
+          fi
+          secret="$$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+          printf '%s\n' \
+            '[default]' \
+            'elasticsearch=http://opensearch:9200' \
+            "passwordSecret=$$secret" \
+            'authMode=digest' \
+            'pcapDir=/opt/arkime/raw' \
+            'viewHost=0.0.0.0' \
+            'viewPort=8005' \
+            'cronQueries=true' \
+            'isLocalViewRegExp=^labcapture$$' \
+            > "$$config"
+          chmod 644 "$$config"
+        fi
+        /opt/arkime/db/db.pl http://opensearch:9200 initorupgradenoprompt --ifneeded
+        if ! curl -fsS http://opensearch:9200/arkime_users/_doc/admin >/dev/null; then
+          if [ ! -s /opt/arkime/etc/admin-password ]; then
+            od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > /opt/arkime/etc/admin-password
+            chmod 600 /opt/arkime/etc/admin-password
+          fi
+          password="$$(cat /opt/arkime/etc/admin-password)"
+          /opt/arkime/bin/arkime_add_user.sh admin 'Admin User' "$$password" --admin
+          echo 'Created admin account.'
+        else
+          echo 'Existing admin account preserved.'
+        fi
+        echo 'Arkime initialization complete.'
+    restart: "no"
+
+  arkime-capture:
+    image: ghcr.io/arkime/arkime/arkime:v6-latest
+    command: ["sleep", "infinity"]
+    depends_on:
+      arkime-init:
+        condition: service_completed_successfully
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.20
+    volumes:
+      - arkime-etc:/opt/arkime/etc
+      - ./pcaps:/pcaps:ro
+      - arkime-raw:/opt/arkime/raw
+    restart: unless-stopped
+
+  arkime-viewer:
+    image: ghcr.io/arkime/arkime/arkime:v6-latest
+    command:
+      - /opt/arkime/bin/docker.sh
+      - viewer
+      - --wait-for-db
+      - http://opensearch:9200
+    depends_on:
+      arkime-init:
+        condition: service_completed_successfully
+    networks:
+      lab-tools:
+        ipv4_address: 10.10.3.21
+    # The internal Docker bridge may block the localhost port mapping.
+    # From Firefox inside Ubuntu, use http://10.10.3.21:8005.
+    ports:
+      - "127.0.0.1:8005:8005"
+    volumes:
+      - arkime-etc:/opt/arkime/etc
+      - arkime-raw:/opt/arkime/raw
+    restart: unless-stopped
+
+networks:
+  lab-left:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+          gateway: 10.10.1.254
+  lab-right:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+          gateway: 10.10.2.254
+  lab-tools:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.3.0/24
+          gateway: 10.10.3.254
+
+volumes:
+  arkime-db:
+  arkime-raw:
+  arkime-etc:
